@@ -49,7 +49,11 @@ if (window.ResizeObserver) new ResizeObserver(queueResize).observe(cv);
 function resumeVideo() {
   if (document.hidden || !video.srcObject) return;
   const track = video.srcObject.getVideoTracks()[0];
-  if (!track || track.readyState === 'ended') { if (!starting) start(); return; }
+  if (!track || track.readyState === 'ended') {
+    // камера работала и дорожка завершилась (звонок, другое приложение) — перезапускаем один раз
+    if (camRunning && !starting) { camRunning = false; start(); }
+    return;
+  }
   if (video.paused) video.play().catch(e => console.warn('video.play()', e));
 }
 document.addEventListener('visibilitychange', resumeVideo);
@@ -260,7 +264,7 @@ function onHands(res, now) {
 
   // режим «звёзды»: другая (не рисующая) рука держит кулак; короткая потеря руки режим не сбрасывает
   const alive = trackers.filter(t => now - t.seen <= MODE_LOST_MS);
-  const fistHeld = alive.some(t => t.id !== drawerId && t.stable === 'fist' && alive.some(o => o !== t && o.stable !== 'fist'));
+  const fistHeld = alive.some(t => t.id !== drawerId && t.stable === 'fist' && alive.some(o => o !== t && o.stable !== 'fist' && now - o.seen <= LOST_MS));
   const newMode = fistHeld ? 'stars' : 'line';
   if (newMode !== mode) {
     if (current) flushChunk(false);
@@ -319,14 +323,16 @@ function path(c, pts) {
 
 // неон: непрозрачная цветная линия с размытым свечением и яркая белая сердцевина поверх.
 // Непрозрачные проходы не дают светлых «бусин» там, где куски линии стыкуются.
+// shadowBlur не масштабируется вместе с холстом, поэтому умножаем на dpr
 function neonGlow(c, s) {
   if (s.pts.length < 2) return;
   const pts = s.pts.map(toScreen);
   c.save();
   c.lineCap = c.lineJoin = 'round';
   c.strokeStyle = s.color; c.shadowColor = s.color;
-  c.lineWidth = 8; c.shadowBlur = 26; path(c, pts); c.stroke();
-  c.lineWidth = 7; c.shadowBlur = 10; path(c, pts); c.stroke();
+  c.lineWidth = 8; c.shadowBlur = 26 * dpr; path(c, pts); c.stroke();
+  c.lineWidth = 7; c.shadowBlur = 10 * dpr; path(c, pts); c.stroke();
+  c.shadowBlur = 0; c.strokeStyle = mix(s.color); c.lineWidth = 4.5; path(c, pts); c.stroke();
   c.restore();
 }
 function neonCore(c, s) {
@@ -334,8 +340,7 @@ function neonCore(c, s) {
   const pts = s.pts.map(toScreen);
   c.save();
   c.lineCap = c.lineJoin = 'round';
-  c.strokeStyle = mix(s.color); c.lineWidth = 4.5; path(c, pts); c.stroke();
-  c.strokeStyle = '#fff'; c.lineWidth = 2.5; c.shadowColor = '#fff'; c.shadowBlur = 4; path(c, pts); c.stroke();
+  c.strokeStyle = '#fff'; c.lineWidth = 2.5; c.shadowColor = '#fff'; c.shadowBlur = 4 * dpr; path(c, pts); c.stroke();
   c.restore();
 }
 const mixCache = {};
@@ -533,7 +538,7 @@ function loop() {
       console.error(e);
       // на некоторых телефонах GPU-режим падает уже во время работы — переходим на CPU
       if (++errors > 3 && delegate === 'GPU') switchToCpu();
-      else if (errors === 60) showError('Распознавание рук перестало работать. Обновите страницу.');
+      else if (errors === 60) { try { landmarker.close(); } catch {} landmarker = null; showError('Распознавание рук перестало работать. Нажмите кнопку, чтобы запустить заново.'); }
     }
     if (res) { lastDetect = now; onHands(res, now); }
   }
@@ -550,7 +555,7 @@ function cameraError(e) {
   if (n === 'NotAllowedError' || n === 'SecurityError') return 'Доступ к камере запрещён. Разрешите камеру для этого сайта в настройках браузера и нажмите кнопку ещё раз.';
   if (n === 'NotFoundError' || n === 'OverconstrainedError') return 'Камера не найдена. Подключите камеру и попробуйте снова.';
   if (n === 'NotReadableError' || n === 'AbortError') return 'Камера занята другим приложением. Закройте его и попробуйте снова.';
-  if (n === 'NotSupportedError' || n === 'TypeError') return 'Этот браузер не даёт доступ к камере. Откройте сайт в Safari или Chrome.';
+  if (n === 'NotSupportedError' || n === 'TypeError') return 'Браузер не даёт этой странице доступ к камере. Откройте сайт напрямую в Safari или Chrome (не во встроенном браузере приложения).';
   return 'Не удалось включить камеру: ' + (e?.message || e);
 }
 function showError(msg) {
@@ -559,7 +564,7 @@ function showError(msg) {
   startBtn.disabled = false; startBtn.textContent = 'Попробовать снова';
 }
 
-let starting = false;
+let starting = false, camRunning = false;
 async function start() {
   if (starting) return;
   starting = true;
@@ -581,6 +586,7 @@ async function start() {
     stream.getVideoTracks()[0]?.addEventListener('ended', () => setTimeout(resumeVideo, 300));
     video.srcObject = stream;
     await video.play();
+    camRunning = true;
     if (!video.videoWidth) await new Promise(r => video.addEventListener('loadedmetadata', r, { once: true }));
     resize();
     stage = 'model';
@@ -596,6 +602,7 @@ async function start() {
     if (!loopStarted) { loopStarted = true; loop(); }
   } catch (e) {
     console.error(e);
+    if (stage === 'camera') { video.srcObject?.getTracks().forEach(t => t.stop()); video.srcObject = null; }
     showError(stage === 'camera' ? cameraError(e) : 'Не удалось загрузить распознавание рук: ' + (e?.message || e));
   } finally {
     clearTimeout(slow); starting = false;

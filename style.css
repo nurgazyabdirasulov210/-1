@@ -36,6 +36,11 @@ button { white-space: nowrap; }
   #tools { position: static; justify-content: center; }
   button { padding: 9px 14px; font-size: 15px; }
 }
+/* очень узкий экран */
+@media (max-width: 360px) {
+  #tools { gap: 6px; }
+  button { padding: 8px 10px; font-size: 14px; }
+}
 /* телефон горизонтально: низкий экран, подсказки компактнее */
 @media (max-height: 500px) {
   #hint { font-size: 11px; flex-direction: row; gap: 4px 8px; }
