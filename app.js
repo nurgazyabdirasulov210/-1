@@ -13,21 +13,24 @@ const STAR_GAP = 40;          // px пути пальца между звёзд�
 const LOST_MS = 250;          // столько ждём пропавшую руку, прежде чем поднять «перо»
 const HOLD_MS = 100;          // жест засчитывается, если держится ≥2 кадров и столько мс
 const MATCH_DIST = 0.25;      // макс. сдвиг запястья между кадрами (доля кадра)
-const CHUNK = 96;             // столько точек линии, после чего кусок запекается
+const MODE_LOST_MS = 700;     // режим «звёзды» держится столько после пропажи кулака (кулак часто заслоняет другая рука)
+const CHUNK = 48;             // столько точек линии, после чего кусок запекается
 const HAND_LINKS = [[0,1],[1,2],[2,3],[3,4],[0,5],[5,6],[6,7],[7,8],[5,9],[9,10],[10,11],[11,12],
   [9,13],[13,14],[14,15],[15,16],[13,17],[17,18],[18,19],[19,20],[0,17]];
 
 // ---------- холст ----------
 let W = 0, H = 0, dpr = 1;
-const baked = document.createElement('canvas');   // готовые куски линий рисуем сюда один раз
-const bctx = baked.getContext('2d');
+// готовые куски линий рисуем один раз: свечение и белую сердцевину отдельно,
+// чтобы на стыках кусков свечение не ложилось поверх сердцевины
+const bakedGlow = document.createElement('canvas'), gctx = bakedGlow.getContext('2d');
+const bakedCore = document.createElement('canvas'), kctx = bakedCore.getContext('2d');
 
 function resize() {
   dpr = Math.min(devicePixelRatio || 1, 2);
-  W = innerWidth; H = innerHeight;
-  for (const c of [cv, baked]) { c.width = Math.round(W * dpr); c.height = Math.round(H * dpr); }
-  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-  bctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  // размер берём у самого холста: на телефонах innerHeight и 100% могут расходиться из-за адресной строки
+  W = cv.clientWidth || innerWidth; H = cv.clientHeight || innerHeight;
+  for (const c of [cv, bakedGlow, bakedCore]) { c.width = Math.round(W * dpr); c.height = Math.round(H * dpr); }
+  for (const c of [ctx, gctx, kctx]) c.setTransform(dpr, 0, 0, dpr, 0, 0);
   rebake();
 }
 let resizeQueued = false;
@@ -40,9 +43,15 @@ function queueResize() {
 addEventListener('resize', queueResize);
 addEventListener('orientationchange', queueResize);
 video.addEventListener('resize', queueResize);   // камера сменила размер кадра (поворот телефона)
+if (window.ResizeObserver) new ResizeObserver(queueResize).observe(cv);
 
 // iOS ставит видео на паузу, когда вкладка скрыта
-function resumeVideo() { if (!document.hidden && video.srcObject && video.paused) video.play().catch(() => {}); }
+function resumeVideo() {
+  if (document.hidden || !video.srcObject) return;
+  const track = video.srcObject.getVideoTracks()[0];
+  if (!track || track.readyState === 'ended') { if (!starting) start(); return; }
+  if (video.paused) video.play().catch(e => console.warn('video.play()', e));
+}
 document.addEventListener('visibilitychange', resumeVideo);
 addEventListener('pageshow', resumeVideo);
 addEventListener('focus', resumeVideo);
@@ -141,7 +150,7 @@ function matchTrackers(hands, now) {
     t.wx = lm[0].x; t.wy = lm[0].y; t.seen = now;
     return t;
   });
-  for (let i = trackers.length - 1; i >= 0; i--) if (now - trackers[i].seen > LOST_MS * 2) trackers.splice(i, 1);
+  for (let i = trackers.length - 1; i >= 0; i--) if (now - trackers[i].seen > MODE_LOST_MS + 300) trackers.splice(i, 1);
   return out;
 }
 
@@ -170,9 +179,9 @@ function startStroke() {
 function flushChunk(keepTail) {
   if (!current || current.pts.length < 2) return;
   const chunk = { id: current.id, color: current.color, pts: current.pts.slice() };
-  strokes.push(chunk); neon(bctx, chunk);
+  strokes.push(chunk); bake(chunk);
   if (!current.baked) { current.baked = true; history.push({ type: 'stroke', id: current.id }); }
-  current.pts = keepTail ? current.pts.slice(-2) : [];
+  current.pts = keepTail ? current.pts.slice(-1) : [];
 }
 function endStroke() {
   if (current) flushChunk(false);
@@ -184,8 +193,8 @@ function penMove(p, now) {   // p — нормализованные коорд�
   if (mode === 'line') {
     if (!current) startStroke();
     const last = current.pts.at(-1);
-    if (!last) current.pts.push(p);
-    else { const lp = toScreen(last); if (Math.hypot(sp.x - lp.x, sp.y - lp.y) >= 1.5) current.pts.push(p); }
+    if (!last) current.pts.push({ ...p, t: now });
+    else { const lp = toScreen(last); if (Math.hypot(sp.x - lp.x, sp.y - lp.y) >= 1.5) current.pts.push({ ...p, t: now }); }
     if (current.pts.length >= CHUNK) flushChunk(true);   // длинную линию запекаем частями
     for (let k = 0; k < 2; k++) addSpark(sp.x, sp.y, Math.random() < .5 ? '#fff' : current.color, 1);
   } else {
@@ -250,7 +259,8 @@ function onHands(res, now) {
   }
 
   // режим «звёзды»: другая (не рисующая) рука держит кулак; короткая потеря руки режим не сбрасывает
-  const fistHeld = trackers.some(t => t.id !== drawerId && t.stable === 'fist' && now - t.seen <= LOST_MS);
+  const alive = trackers.filter(t => now - t.seen <= MODE_LOST_MS);
+  const fistHeld = alive.some(t => t.id !== drawerId && t.stable === 'fist' && alive.some(o => o !== t && o.stable !== 'fist'));
   const newMode = fistHeld ? 'stars' : 'line';
   if (newMode !== mode) {
     if (current) flushChunk(false);
@@ -269,8 +279,13 @@ function onHands(res, now) {
 
   lastHands = found.map(h => ({ lm: h.lm, g: h.g, drawer: h === drawer }));
 
-  if (drawer && drawer.g === 'point') {
+  if (drawer && drawer.g === 'point' && drawer.raw !== 'point') {
+    // палец уже сгибается (жест ещё не сменился) — перо ждёт и не рисует крючок к кулаку
+    lastDrawSeen = now;
+    if (!drawer.tr.bent) { drawer.tr.bent = true; trimTail(now); }
+  } else if (drawer && drawer.g === 'point') {
     const tr = drawer.tr;
+    tr.bent = false;
     if (!penDown) { tr.fx.reset(); tr.fy.reset(); }
     tipNorm = { x: tr.fx.f(drawer.lm[8].x, now), y: tr.fy.f(drawer.lm[8].y, now) };
     penDown = true; lastDrawSeen = now;
@@ -278,6 +293,12 @@ function onHands(res, now) {
   } else if (penDown && drawer) {
     endStroke();   // рисующая рука видна, но палец уже не вытянут
   }
+}
+
+// убираем точки последних ~80 мс: в них палец уже начал сгибаться
+function trimTail(now) {
+  if (!current || mode !== 'line') return;
+  while (current.pts.length > 1 && now - current.pts.at(-1).t < 80) current.pts.pop();
 }
 
 // пропажа руки дольше LOST_MS поднимает «перо»
@@ -296,18 +317,25 @@ function path(c, pts) {
   const l = pts.at(-1); c.lineTo(l.x, l.y);
 }
 
-// неон: цветное свечение в несколько слоёв и яркая белая сердцевина
-function neon(c, s) {
+// неон: непрозрачная цветная линия с размытым свечением и яркая белая сердцевина поверх.
+// Непрозрачные проходы не дают светлых «бусин» там, где куски линии стыкуются.
+function neonGlow(c, s) {
   if (s.pts.length < 2) return;
   const pts = s.pts.map(toScreen);
   c.save();
   c.lineCap = c.lineJoin = 'round';
-  c.strokeStyle = s.color;
-  c.globalAlpha = .10; c.lineWidth = 30; path(c, pts); c.stroke();
-  c.globalAlpha = .22; c.lineWidth = 17; path(c, pts); c.stroke();
-  c.globalAlpha = .65; c.lineWidth = 9;  path(c, pts); c.stroke();
-  c.globalAlpha = 1;   c.lineWidth = 5;  c.strokeStyle = mix(s.color); path(c, pts); c.stroke();
-  c.strokeStyle = '#fff'; c.lineWidth = 2.5; path(c, pts); c.stroke();
+  c.strokeStyle = s.color; c.shadowColor = s.color;
+  c.lineWidth = 8; c.shadowBlur = 26; path(c, pts); c.stroke();
+  c.lineWidth = 7; c.shadowBlur = 10; path(c, pts); c.stroke();
+  c.restore();
+}
+function neonCore(c, s) {
+  if (s.pts.length < 2) return;
+  const pts = s.pts.map(toScreen);
+  c.save();
+  c.lineCap = c.lineJoin = 'round';
+  c.strokeStyle = mix(s.color); c.lineWidth = 4.5; path(c, pts); c.stroke();
+  c.strokeStyle = '#fff'; c.lineWidth = 2.5; c.shadowColor = '#fff'; c.shadowBlur = 4; path(c, pts); c.stroke();
   c.restore();
 }
 const mixCache = {};
@@ -316,9 +344,10 @@ function mix(hex) {   // цвет между белым и цветом лини
   const n = parseInt(hex.slice(1), 16), m = v => Math.round(v + (255 - v) * .45);
   return (mixCache[hex] = `rgb(${m(n >> 16)},${m((n >> 8) & 255)},${m(n & 255)})`);
 }
+function bake(s) { neonGlow(gctx, s); neonCore(kctx, s); }
 function rebake() {
-  bctx.clearRect(0, 0, W, H);
-  for (const s of strokes) neon(bctx, s);
+  gctx.clearRect(0, 0, W, H); kctx.clearRect(0, 0, W, H);
+  for (const s of strokes) bake(s);
 }
 
 // спрайт звезды со свечением (рисуется один раз)
@@ -343,8 +372,10 @@ const starSprite = (() => {
 
 let lastRender = 0;
 function drawEffects(c, now, dt) {
-  c.drawImage(baked, 0, 0, W, H);
-  if (current) neon(c, current);
+  c.drawImage(bakedGlow, 0, 0, W, H);
+  if (current) neonGlow(c, current);
+  c.drawImage(bakedCore, 0, 0, W, H);
+  if (current) neonCore(c, current);
 
   // созвездия: соседние звёзды одной серии соединены тонкими линиями
   c.save();
@@ -477,6 +508,10 @@ const gpuTimes = [];
 function checkSpeed(ms) {
   if (delegate !== 'GPU' || gpuTimes.length >= 10) return;
   gpuTimes.push(ms);
+  // явно медленный (программный) GPU — не ждём 10 кадров
+  if (gpuTimes.length >= 4 && gpuTimes.slice(2).every(t => t > 250)) {
+    console.warn(`GPU медленный (${ms.toFixed(0)} мс на кадр), перехожу на CPU`); gpuTimes.length = 10; switchToCpu(); return;
+  }
   if (gpuTimes.length === 10) {
     const med = gpuTimes.slice(2).sort((a, b) => a - b)[4];   // первые кадры — прогрев
     if (med > 80) { console.warn(`GPU медленный (${med.toFixed(0)} мс на кадр), перехожу на CPU`); switchToCpu(); }
@@ -498,6 +533,7 @@ function loop() {
       console.error(e);
       // на некоторых телефонах GPU-режим падает уже во время работы — переходим на CPU
       if (++errors > 3 && delegate === 'GPU') switchToCpu();
+      else if (errors === 60) showError('Распознавание рук перестало работать. Обновите страницу.');
     }
     if (res) { lastDetect = now; onHands(res, now); }
   }
@@ -514,6 +550,7 @@ function cameraError(e) {
   if (n === 'NotAllowedError' || n === 'SecurityError') return 'Доступ к камере запрещён. Разрешите камеру для этого сайта в настройках браузера и нажмите кнопку ещё раз.';
   if (n === 'NotFoundError' || n === 'OverconstrainedError') return 'Камера не найдена. Подключите камеру и попробуйте снова.';
   if (n === 'NotReadableError' || n === 'AbortError') return 'Камера занята другим приложением. Закройте его и попробуйте снова.';
+  if (n === 'NotSupportedError' || n === 'TypeError') return 'Этот браузер не даёт доступ к камере. Откройте сайт в Safari или Chrome.';
   return 'Не удалось включить камеру: ' + (e?.message || e);
 }
 function showError(msg) {
@@ -522,8 +559,12 @@ function showError(msg) {
   startBtn.disabled = false; startBtn.textContent = 'Попробовать снова';
 }
 
+let starting = false;
 async function start() {
+  if (starting) return;
+  starting = true;
   startBtn.disabled = true;
+  const slow = setTimeout(() => { if (stage === 'camera') statusEl.textContent = 'Разрешите доступ к камере в запросе браузера…'; }, 6000);
   statusEl.classList.remove('error');
   let stage = 'camera';
   try {
@@ -537,6 +578,7 @@ async function start() {
       if (e.name !== 'OverconstrainedError') throw e;
       stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
     }
+    stream.getVideoTracks()[0]?.addEventListener('ended', () => setTimeout(resumeVideo, 300));
     video.srcObject = stream;
     await video.play();
     if (!video.videoWidth) await new Promise(r => video.addEventListener('loadedmetadata', r, { once: true }));
@@ -546,6 +588,7 @@ async function start() {
       statusEl.textContent = 'Загружаю распознавание рук…';
       landmarker = await createLandmarker(new URLSearchParams(location.search).get('delegate') === 'cpu' ? 'CPU' : 'GPU');
     }
+    statusEl.textContent = '';
     document.getElementById('start').classList.add('off');
     document.getElementById('tools').hidden = false;
     document.getElementById('hint').hidden = false;
@@ -554,6 +597,8 @@ async function start() {
   } catch (e) {
     console.error(e);
     showError(stage === 'camera' ? cameraError(e) : 'Не удалось загрузить распознавание рук: ' + (e?.message || e));
+  } finally {
+    clearTimeout(slow); starting = false;
   }
 }
 let loopStarted = false;
