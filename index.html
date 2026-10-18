@@ -7,28 +7,30 @@
 <link rel="stylesheet" href="style.css">
 </head>
 <body>
-<video id="video" playsinline muted></video>
+<video id="video" playsinline muted autoplay></video>
 <canvas id="fx"></canvas>
 
+<div id="mode">Покажи руку в камеру</div>
+
 <div id="hint">
-  <span>☝️ Один палец — рисуем неоновую линию</span>
-  <span>✊ Сжатый кулак — появляются звёздочки</span>
-  <span>🖐 Раскрытая ладонь — звёзды улетают</span>
+  <span>☝️ Указательный палец — неоновая линия</span>
+  <span>✊ Вторая рука в кулак — палец рисует звёзды</span>
+  <span>🖐 Разожми вторую руку — звёзды улетают</span>
 </div>
 
 <div id="start">
   <h1>Магия рук</h1>
-  <p>Рисуй пальцем в воздухе, ставь звёзды кулаком и запускай их ладонью.</p>
+  <p>Рисуй пальцем в воздухе. Сожми вторую руку в кулак, чтобы рисовать звёзды, а потом раскрой ладонь, и они улетят.</p>
   <button id="startBtn">Включить камеру</button>
   <p id="status"></p>
 </div>
 
 <div id="tools" hidden>
+  <button id="undoBtn">↶ Отменить</button>
   <button id="clearBtn">Очистить</button>
-  <button id="shotBtn">Фото</button>
+  <button id="shotBtn">📷 Фото</button>
 </div>
 
-<script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4.1675469240/hands.js" crossorigin="anonymous"></script>
-<script src="app.js"></script>
+<script type="module" src="app.js"></script>
 </body>
 </html>

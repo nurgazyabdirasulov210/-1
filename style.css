@@ -13,3 +13,10 @@ button { font: inherit; color: #fff; border: 1px solid rgba(255,255,255,.5); bac
 #startBtn { font-size: 18px; box-shadow: 0 0 20px #7df8; }
 #tools { position: fixed; top: max(12px, env(safe-area-inset-top)); right: 12px; display: flex; gap: 8px; }
 #tools[hidden] { display: none; }
+#mode { position: fixed; top: max(12px, env(safe-area-inset-top)); left: 12px; padding: 8px 14px; border-radius: 99px; background: rgba(0,0,0,.45); backdrop-filter: blur(6px); font-weight: 600; border: 1px solid #3dfcff; box-shadow: 0 0 12px #3dfcff88; pointer-events: none; }
+#mode.stars { border-color: #ffe94d; box-shadow: 0 0 12px #ffe94d88; }
+#status { min-height: 1.2em; }
+@media (max-width: 600px) {
+  #hint { font-size: 12px; }
+  #tools { top: auto; bottom: calc(max(12px, env(safe-area-inset-bottom)) + 96px); right: 50%; transform: translateX(50%); }
+}

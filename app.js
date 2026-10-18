@@ -1,137 +1,239 @@
+import { FilesetResolver, HandLandmarker } from './lib/vision_bundle.mjs';
+
 const video = document.getElementById('video');
 const cv = document.getElementById('fx');
 const ctx = cv.getContext('2d');
 const statusEl = document.getElementById('status');
+const modeEl = document.getElementById('mode');
+
+// ---------- холст ----------
 let W = 0, H = 0, dpr = 1;
+const baked = document.createElement('canvas');   // готовые линии рисуем один раз сюда
+const bctx = baked.getContext('2d');
 
 function resize() {
   dpr = Math.min(devicePixelRatio || 1, 2);
   W = innerWidth; H = innerHeight;
-  cv.width = W * dpr; cv.height = H * dpr;
+  for (const c of [cv, baked]) { c.width = W * dpr; c.height = H * dpr; }
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  bctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  rebake();
 }
 addEventListener('resize', resize);
-resize();
 
-// ---------- состояние эффектов ----------
-const strokes = [];          // неоновые линии
-const stars = [];            // звёзды
-const sparks = [];           // искры
-const COLORS = ['#ff6ec7', '#ffe94d', '#4dfff0', '#8cff4d', '#ff9a4d', '#a98bff'];
-let colorIdx = 0;
-let groupId = 0;
-const hands = {};            // состояние по каждой руке (индекс)
+// ---------- настройки ----------
+const COLORS = ['#ff4fd8', '#ffe94d', '#3dfcff', '#7dff4d', '#ff8a3d', '#a98bff'];
+const STAR_GAP = 42;          // px между звёздами при рисовании
+const LOST_MS = 250;          // сколько ждём потерянную руку, прежде чем поднять «перо»
+const HAND_LINKS = [[0,1],[1,2],[2,3],[3,4],[0,5],[5,6],[6,7],[7,8],[5,9],[9,10],[10,11],[11,12],
+  [9,13],[13,14],[14,15],[15,16],[13,17],[17,18],[18,19],[19,20],[0,17]];
 
-// ---------- распознавание жестов ----------
-const d = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
-function gestureOf(lm) {
-  const w = lm[0];
-  const ext = [[8, 6], [12, 10], [16, 14], [20, 18]].map(([t, p]) => d(lm[t], w) > d(lm[p], w) * 1.12);
-  const n = ext.filter(Boolean).length;
-  if (ext[0] && n === 1) return 'point';
-  if (n === 0) return 'fist';
-  if (n >= 4) return 'open';
-  return 'other';
+// ---------- состояние ----------
+const strokes = [];           // готовые линии {pts, color}
+const stars = [];             // {x,y,r,rot,born,ph,group,fly,vx,vy,life,trail}
+const sparks = [];
+const history = [];           // для «Отменить»: 'stroke' | номер группы звёзд
+let colorIdx = 0, groupId = 0;
+let current = null;           // линия, которую рисуем сейчас
+let drawerKey = null;         // какая рука рисует
+let penDown = false, mode = 'line', lastSeen = 0;
+let lastStar = null, curGroup = 0;
+const trackers = new Map();   // key -> {votes, stable, filter}
+
+// ---------- фильтр дрожания (One Euro) ----------
+class OneEuro {
+  constructor(minCut = 1.2, beta = 0.02, dCut = 1) { Object.assign(this, { minCut, beta, dCut, x: null, dx: 0, t: 0 }); }
+  alpha(cut, dt) { const r = 2 * Math.PI * cut * dt; return r / (r + 1); }
+  f(v, t) {
+    if (this.x === null) { this.x = v; this.t = t; return v; }
+    const dt = Math.max((t - this.t) / 1000, 1e-3); this.t = t;
+    const dx = (v - this.x) / dt;
+    this.dx += this.alpha(this.dCut, dt) * (dx - this.dx);
+    const cut = this.minCut + this.beta * Math.abs(this.dx);
+    this.x += this.alpha(cut, dt) * (v - this.x);
+    return this.x;
+  }
 }
 
-// координаты видео -> экран (зеркально, object-fit: cover)
+// ---------- координаты ----------
 function toScreen(p) {
   const vw = video.videoWidth || 640, vh = video.videoHeight || 480;
   const s = Math.max(W / vw, H / vh);
-  const ox = (W - vw * s) / 2, oy = (H - vh * s) / 2;
-  return { x: W - (p.x * vw * s + ox), y: p.y * vh * s + oy };
+  return { x: W - (p.x * vw * s + (W - vw * s) / 2), y: p.y * vh * s + (H - vh * s) / 2 };
 }
 
-function onResults(res) {
-  const seen = new Set();
-  (res.multiHandLandmarks || []).forEach((lm, i) => {
-    seen.add(i);
-    const h = hands[i] || (hands[i] = { hist: [], tip: null, stroke: null, lastStar: null, lastStarT: 0, prev: 'other' });
-    h.hist.push(gestureOf(lm));
-    if (h.hist.length > 4) h.hist.shift();
-    // устойчивый жест: большинство из последних кадров
-    const cnt = {};
-    h.hist.forEach(g => cnt[g] = (cnt[g] || 0) + 1);
-    const g = Object.keys(cnt).sort((a, b) => cnt[b] - cnt[a])[0];
-    const now = performance.now();
-
-    if (g === 'point') {
-      const raw = toScreen(lm[8]);
-      h.tip = h.tip ? { x: h.tip.x + (raw.x - h.tip.x) * 0.5, y: h.tip.y + (raw.y - h.tip.y) * 0.5 } : raw;
-      if (!h.stroke) {
-        h.stroke = { pts: [], color: COLORS[colorIdx++ % COLORS.length] };
-        strokes.push(h.stroke);
-      }
-      h.stroke.pts.push({ x: h.tip.x, y: h.tip.y });
-      for (let k = 0; k < 2; k++) addSpark(h.tip.x, h.tip.y, h.stroke.color);
-    } else {
-      h.stroke = null; h.tip = null;
-    }
-
-    if (g === 'fist') {
-      const c = [0, 5, 9, 13, 17].map(k => toScreen(lm[k]));
-      const p = { x: c.reduce((s, q) => s + q.x, 0) / 5, y: c.reduce((s, q) => s + q.y, 0) / 5 };
-      if (h.prev !== 'fist') { groupId++; h.lastStar = null; }
-      if (!h.lastStar || Math.hypot(p.x - h.lastStar.x, p.y - h.lastStar.y) > 55 || now - h.lastStarT > 500) {
-        stars.push({ x: p.x, y: p.y, r: 7 + Math.random() * 7, rot: Math.random() * 6.28, born: now,
-                     ph: Math.random() * 6.28, group: groupId, vx: 0, vy: 0, fly: false, life: 1 });
-        h.lastStar = p; h.lastStarT = now;
-      }
-    }
-
-    if (g === 'open' && stars.length) {
-      const c = toScreen(lm[9]);
-      stars.forEach(s => {
-        if (s.fly) return;
-        const a = Math.atan2(s.y - c.y, s.x - c.x) + (Math.random() - 0.5) * 1.2;
-        const sp = 8 + Math.random() * 14;
-        s.fly = true; s.vx = Math.cos(a) * sp; s.vy = Math.sin(a) * sp - 4;
-      });
-    }
-    h.prev = g;
+// ---------- жесты ----------
+function gestureOf(lm) {
+  const vw = video.videoWidth || 1, vh = video.videoHeight || 1;
+  const P = lm.map(p => ({ x: p.x * vw, y: p.y * vh, z: p.z * vw }));
+  const dist = (a, b) => Math.hypot(P[a].x - P[b].x, P[a].y - P[b].y, P[a].z - P[b].z);
+  const angle = (a, b, c) => {          // угол в суставе b, градусы
+    const u = [P[a].x - P[b].x, P[a].y - P[b].y, P[a].z - P[b].z];
+    const v = [P[c].x - P[b].x, P[c].y - P[b].y, P[c].z - P[b].z];
+    const cos = (u[0]*v[0] + u[1]*v[1] + u[2]*v[2]) / (Math.hypot(...u) * Math.hypot(...v) || 1);
+    return Math.acos(Math.max(-1, Math.min(1, cos))) * 180 / Math.PI;
+  };
+  const palm = dist(0, 9) || 1;
+  const fingers = [[5, 6, 7, 8], [9, 10, 11, 12], [13, 14, 15, 16], [17, 18, 19, 20]].map(([m, p, d, t]) => {
+    const straight = angle(m, p, d) > 150 && angle(p, d, t) > 140;
+    const far = dist(t, 0) > dist(p, 0) * 1.15;
+    return {
+      ext: straight && far,
+      fold: dist(t, 0) < dist(p, 0) * 1.05 || dist(t, m) < palm * 0.45,
+    };
   });
-  Object.keys(hands).forEach(k => { if (!seen.has(+k)) { hands[k].stroke = null; hands[k].tip = null; hands[k].prev = 'other'; } });
+  const ext = fingers.filter(f => f.ext).length;
+  const fold = fingers.filter(f => f.fold).length;
+  if (fingers[0].ext && !fingers[1].ext && !fingers[2].ext && !fingers[3].ext) return 'point';
+  if (ext === 0 && fold >= 3) return 'fist';
+  if (ext >= 4) return 'open';
+  return 'other';
+}
+
+// жест считается сменившимся, только если держится хотя бы 2 кадра и ~0.1 с
+function stableGesture(tr, g, now) {
+  if (g === tr.cand) tr.n++; else { tr.cand = g; tr.n = 1; tr.since = now; }
+  if (tr.n >= 2 && now - tr.since >= (g === 'point' ? 50 : 100)) tr.stable = g;
+  return tr.stable;
+}
+
+// ---------- обработка кадра ----------
+function onHands(res, now) {
+  const found = [];
+  const used = new Set();
+  res.landmarks.forEach((lm, i) => {
+    let key = res.handednesses?.[i]?.[0]?.categoryName || 'Hand';
+    if (used.has(key)) key += i;
+    used.add(key);
+    let tr = trackers.get(key);
+    if (!tr) trackers.set(key, tr = { cand: 'other', n: 0, since: now, stable: 'other', prev: 'other', fx: new OneEuro(), fy: new OneEuro(), seen: 0 });
+    tr.seen = now;
+    found.push({ key, lm, g: stableGesture(tr, gestureOf(lm), now), tr });
+  });
+  for (const [k, tr] of trackers) if (now - tr.seen > 1000) trackers.delete(k);
+
+  // кто рисует, а кто управляет
+  let drawer = found.find(h => h.key === drawerKey);
+  const pointing = found.filter(h => h.g === 'point');
+  if (!drawer || (drawer.g !== 'point' && pointing.length)) drawer = pointing[0] || drawer || (found.length === 1 ? found[0] : null);
+  if (drawer) drawerKey = drawer.key;
+  const mod = found.find(h => h !== drawer) || null;
+
+  // вторая рука в кулаке = рисуем звёзды; любая рука раскрылась = звёзды улетают
+  const newMode = mod && mod.g === 'fist' ? 'stars' : 'line';
+  for (const h of found) {
+    if (h.g === 'open' && h.tr.prev !== 'open') launchStars(toScreen(h.lm[9]));
+    h.tr.prev = h.g;
+  }
+  if (newMode !== mode) { endStroke(); mode = newMode; }
+
+  const handsOut = found.map(h => ({ lm: h.lm, pts: h.lm.map(toScreen), role: h === drawer ? 'drawer' : 'mod', g: h.g }));
+
+  if (drawer && drawer.g === 'point') {
+    lastSeen = now;
+    const raw = toScreen(drawer.lm[8]);
+    const tip = { x: drawer.tr.fx.f(raw.x, now), y: drawer.tr.fy.f(raw.y, now) };
+    if (!penDown) { penDown = true; startStroke(tip); }
+    moveTo(tip, now);
+    return { hands: handsOut, tip };
+  }
+  if (penDown && (drawer || now - lastSeen > LOST_MS)) endStroke();
+  if (drawer && drawer.g !== 'point') { drawer.tr.fx.x = null; drawer.tr.fy.x = null; }
+  return { hands: handsOut, tip: null };
+}
+
+function startStroke(p) {
+  if (mode === 'line') {
+    current = { pts: [p], color: COLORS[colorIdx++ % COLORS.length] };
+  } else {
+    curGroup = ++groupId; lastStar = null;
+  }
+}
+
+function moveTo(p, now) {
+  if (mode === 'line') {
+    if (!current) startStroke(p);
+    const last = current.pts[current.pts.length - 1];
+    if (Math.hypot(p.x - last.x, p.y - last.y) > 1.5) current.pts.push(p);
+    if (Math.random() < .7) addSpark(p.x, p.y, current.color);
+  } else {
+    if (!curGroup) curGroup = ++groupId;
+    if (!lastStar || Math.hypot(p.x - lastStar.x, p.y - lastStar.y) > STAR_GAP) {
+      if (!lastStar) history.push(curGroup);
+      stars.push({ x: p.x, y: p.y, r: 9 + Math.random() * 8, rot: Math.random() * 6.28, born: now, ph: Math.random() * 6.28,
+                   group: curGroup, fly: false, vx: 0, vy: 0, life: 1, trail: [] });
+      for (let k = 0; k < 8; k++) addSpark(p.x, p.y, '#fff3a0');
+      lastStar = { x: p.x, y: p.y };
+    }
+  }
+}
+
+function endStroke() {
+  penDown = false;
+  if (current && current.pts.length > 1) { strokes.push(current); history.push('stroke'); bake(current); }
+  current = null; lastStar = null; curGroup = 0;
+}
+
+function launchStars(c) {
+  for (const s of stars) {
+    if (s.fly) continue;
+    const a = Math.atan2(s.y - c.y, s.x - c.x) + (Math.random() - .5) * .8;
+    const sp = 2.5 + Math.random() * 3.5;
+    s.fly = true; s.vx = Math.cos(a) * sp; s.vy = Math.sin(a) * sp - 1.5;
+  }
 }
 
 function addSpark(x, y, color) {
-  const a = Math.random() * 6.28, sp = 1 + Math.random() * 3;
+  const a = Math.random() * 6.28, sp = .5 + Math.random() * 2.5;
   sparks.push({ x, y, vx: Math.cos(a) * sp, vy: Math.sin(a) * sp, life: 1, color });
 }
 
-// ---------- отрисовка ----------
-function drawStar(x, y, r, rot) {
-  ctx.beginPath();
-  for (let i = 0; i < 10; i++) {
-    const rr = i % 2 ? r * 0.45 : r, a = rot + i * Math.PI / 5 - Math.PI / 2;
-    ctx.lineTo(x + Math.cos(a) * rr, y + Math.sin(a) * rr);
+// ---------- рисование ----------
+function path(c, pts) {
+  c.beginPath(); c.moveTo(pts[0].x, pts[0].y);
+  for (let i = 1; i < pts.length - 1; i++) {
+    const m = { x: (pts[i].x + pts[i + 1].x) / 2, y: (pts[i].y + pts[i + 1].y) / 2 };
+    c.quadraticCurveTo(pts[i].x, pts[i].y, m.x, m.y);
   }
-  ctx.closePath();
+  const l = pts[pts.length - 1]; c.lineTo(l.x, l.y);
 }
 
-function strokePath(pts) {
-  ctx.beginPath();
-  pts.forEach((p, i) => i ? ctx.lineTo(p.x, p.y) : ctx.moveTo(p.x, p.y));
+function neon(c, s) {
+  if (s.pts.length < 2) return;
+  c.lineCap = c.lineJoin = 'round';
+  c.strokeStyle = s.color;
+  c.globalAlpha = .18; c.lineWidth = 22; path(c, s.pts); c.stroke();
+  c.globalAlpha = .45; c.lineWidth = 10; path(c, s.pts); c.stroke();
+  c.globalAlpha = 1;   c.lineWidth = 5;  path(c, s.pts); c.stroke();
+  c.strokeStyle = '#fff'; c.lineWidth = 2; path(c, s.pts); c.stroke();
 }
 
-function frame() {
-  const now = performance.now();
+function bake(s) { neon(bctx, s); }
+function rebake() { bctx.clearRect(0, 0, W, H); strokes.forEach(bake); }
+
+// спрайт звезды со свечением (рисуется один раз)
+const starSprite = (() => {
+  const c = document.createElement('canvas'), S = 128; c.width = c.height = S;
+  const x = c.getContext('2d');
+  const g = x.createRadialGradient(S/2, S/2, 0, S/2, S/2, S/2);
+  g.addColorStop(0, 'rgba(255,240,170,.9)'); g.addColorStop(.25, 'rgba(255,220,110,.35)'); g.addColorStop(1, 'rgba(255,220,110,0)');
+  x.fillStyle = g; x.fillRect(0, 0, S, S);
+  x.beginPath();
+  for (let i = 0; i < 10; i++) {
+    const r = i % 2 ? 9 : 24, a = i * Math.PI / 5 - Math.PI / 2;
+    x.lineTo(S/2 + Math.cos(a) * r, S/2 + Math.sin(a) * r);
+  }
+  x.closePath(); x.fillStyle = '#fff6c2'; x.shadowColor = '#ffd94d'; x.shadowBlur = 12; x.fill();
+  return c;
+})();
+
+function render(now, frame) {
   ctx.clearRect(0, 0, W, H);
-  ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+  ctx.drawImage(baked, 0, 0, W, H);
+  if (current) neon(ctx, current);
 
-  // неоновые линии
-  strokes.forEach(s => {
-    if (s.pts.length < 2) return;
-    ctx.shadowColor = s.color; ctx.shadowBlur = 22;
-    ctx.strokeStyle = s.color; ctx.lineWidth = 7; ctx.globalAlpha = .55;
-    strokePath(s.pts); ctx.stroke();
-    ctx.globalAlpha = 1; ctx.shadowBlur = 10;
-    ctx.strokeStyle = '#fff'; ctx.lineWidth = 2.5;
-    strokePath(s.pts); ctx.stroke();
-  });
-  ctx.shadowBlur = 0;
-
-  // созвездия: линии между соседними звёздами
-  ctx.strokeStyle = 'rgba(255,255,255,.5)'; ctx.lineWidth = 1;
+  // линии созвездий
+  ctx.strokeStyle = 'rgba(255,245,200,.55)'; ctx.lineWidth = 1.2;
   for (let i = 1; i < stars.length; i++) {
     const a = stars[i - 1], b = stars[i];
     if (a.group !== b.group || a.fly || b.fly) continue;
@@ -142,79 +244,143 @@ function frame() {
   for (let i = stars.length - 1; i >= 0; i--) {
     const s = stars[i];
     if (s.fly) {
-      s.x += s.vx; s.y += s.vy; s.vx *= 0.985; s.vy *= 0.985; s.rot += 0.08; s.life -= 0.012;
-      if (s.life <= 0 || s.x < -80 || s.x > W + 80 || s.y < -80 || s.y > H + 80) { stars.splice(i, 1); continue; }
-      if (Math.random() < .6) addSpark(s.x, s.y, '#fff3a0');
+      s.trail.push({ x: s.x, y: s.y }); if (s.trail.length > 14) s.trail.shift();
+      s.vx *= 1.012; s.vy = s.vy * 1.012 - .06;
+      s.x += s.vx; s.y += s.vy; s.rot += .15; s.life -= .006;
+      if (s.life <= 0 || s.x < -150 || s.x > W + 150 || s.y < -150 || s.y > H + 150) { stars.splice(i, 1); continue; }
+      ctx.lineCap = 'round';
+      for (let k = 1; k < s.trail.length; k++) {
+        ctx.globalAlpha = (k / s.trail.length) * .6 * s.life;
+        ctx.strokeStyle = '#ffe98a'; ctx.lineWidth = (k / s.trail.length) * s.r * .6;
+        ctx.beginPath(); ctx.moveTo(s.trail[k-1].x, s.trail[k-1].y); ctx.lineTo(s.trail[k].x, s.trail[k].y); ctx.stroke();
+      }
     }
-    const tw = 0.75 + 0.25 * Math.sin(now / 250 + s.ph);
-    const pop = Math.min(1, (now - s.born) / 200);
-    const r = s.r * tw * (0.4 + 0.6 * pop);
+    const tw = .8 + .2 * Math.sin(now / 220 + s.ph);
+    const pop = Math.min(1, (now - s.born) / 180);
+    const size = s.r * 5.3 * tw * (pop < 1 ? pop * 1.3 : 1);
     ctx.globalAlpha = Math.max(0, s.life);
-    ctx.shadowColor = '#ffe27a'; ctx.shadowBlur = 20;
-    ctx.fillStyle = '#fff3a8';
-    drawStar(s.x, s.y, r, s.rot); ctx.fill();
-    ctx.shadowBlur = 0;
+    ctx.save(); ctx.translate(s.x, s.y); ctx.rotate(s.rot);
+    ctx.drawImage(starSprite, -size / 2, -size / 2, size, size);
+    ctx.restore();
   }
   ctx.globalAlpha = 1;
 
   // искры
   for (let i = sparks.length - 1; i >= 0; i--) {
     const p = sparks[i];
-    p.x += p.vx; p.y += p.vy; p.life -= 0.05;
+    p.x += p.vx; p.y += p.vy; p.vy += .03; p.life -= .04;
     if (p.life <= 0) { sparks.splice(i, 1); continue; }
     ctx.globalAlpha = p.life; ctx.fillStyle = p.color;
-    ctx.fillRect(p.x, p.y, 2, 2);
+    ctx.fillRect(p.x - 1, p.y - 1, 2.5, 2.5);
   }
   ctx.globalAlpha = 1;
 
-  // кончик пальца
-  Object.values(hands).forEach(h => {
-    if (!h.tip) return;
-    ctx.shadowColor = '#fff'; ctx.shadowBlur = 20; ctx.fillStyle = '#fff';
-    ctx.beginPath(); ctx.arc(h.tip.x, h.tip.y, 5, 0, 6.28); ctx.fill();
-    ctx.shadowBlur = 0;
-  });
+  // скелет рук
+  if (frame) {
+    for (const h of frame.hands) {
+      ctx.strokeStyle = h.role === 'drawer' ? 'rgba(61,252,255,.75)' : (h.g === 'fist' ? 'rgba(255,233,77,.8)' : 'rgba(255,255,255,.55)');
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      for (const [a, b] of HAND_LINKS) { ctx.moveTo(h.pts[a].x, h.pts[a].y); ctx.lineTo(h.pts[b].x, h.pts[b].y); }
+      ctx.stroke();
+      ctx.fillStyle = ctx.strokeStyle;
+      for (const p of h.pts) ctx.fillRect(p.x - 2, p.y - 2, 4, 4);
+    }
+    if (frame.tip) {
+      ctx.fillStyle = mode === 'stars' ? '#ffe94d' : '#fff';
+      ctx.shadowColor = ctx.fillStyle; ctx.shadowBlur = 18;
+      ctx.beginPath(); ctx.arc(frame.tip.x, frame.tip.y, 7, 0, 6.29); ctx.fill();
+      ctx.shadowBlur = 0;
+    }
+  }
+}
 
-  requestAnimationFrame(frame);
+function updateHud(frame) {
+  const n = frame ? frame.hands.length : 0;
+  const m = mode === 'stars' ? '⭐ Звёзды' : '✏️ Линия';
+  const pen = penDown ? ' · рисую' : '';
+  const txt = n ? `${m}${pen}` : 'Покажи руку в камеру';
+  if (modeEl.textContent !== txt) modeEl.textContent = txt;
+  modeEl.classList.toggle('stars', mode === 'stars');
 }
 
 // ---------- запуск ----------
+let landmarker = null, lastVideoTime = -1, lastFrame = null, delegate = 'GPU', errors = 0;
+
+async function createLandmarker(prefer) {
+  const fileset = await FilesetResolver.forVisionTasks(new URL('./lib/wasm', import.meta.url).href);
+  const opts = delegate => ({
+    baseOptions: { modelAssetPath: new URL('./models/hand_landmarker.task', import.meta.url).href, delegate },
+    runningMode: 'VIDEO', numHands: 2,
+    minHandDetectionConfidence: .5, minHandPresenceConfidence: .5, minTrackingConfidence: .5,
+  });
+  if (prefer === 'GPU') {
+    try { return await HandLandmarker.createFromOptions(fileset, opts('GPU')); }
+    catch (e) { console.warn('GPU недоступен, перехожу на CPU', e); }
+  }
+  delegate = 'CPU';
+  return HandLandmarker.createFromOptions(fileset, opts('CPU'));
+}
+
+function loop() {
+  const now = performance.now();
+  if (landmarker && video.readyState >= 2 && video.currentTime !== lastVideoTime) {
+    lastVideoTime = video.currentTime;
+    try { lastFrame = onHands(landmarker.detectForVideo(video, now), now); errors = 0; }
+    catch (e) {
+      console.error(e);
+      // на некоторых телефонах GPU-режим падает уже во время работы — переключаемся на CPU
+      if (++errors > 5 && delegate === 'GPU' && landmarker) {
+        const old = landmarker; landmarker = null; delegate = 'CPU';
+        createLandmarker('CPU').then(l => { landmarker = l; errors = 0; old.close(); });
+      }
+    }
+  }
+  render(now, lastFrame);
+  updateHud(lastFrame);
+  requestAnimationFrame(loop);
+}
+
 async function start() {
   const btn = document.getElementById('startBtn');
-  btn.disabled = true; statusEl.textContent = 'Запускаю камеру…';
+  btn.disabled = true;
   try {
-    const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'user', width: 1280, height: 720 }, audio: false });
+    if (!navigator.mediaDevices?.getUserMedia) throw new Error('браузер не даёт доступ к камере (нужен HTTPS)');
+    statusEl.textContent = 'Включаю камеру…';
+    const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'user', width: { ideal: 1280 }, height: { ideal: 720 } }, audio: false });
     video.srcObject = stream;
     await video.play();
-    const hd = new Hands({ locateFile: f => `https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4.1675469240/${f}` });
-    hd.setOptions({ maxNumHands: 2, modelComplexity: 1, minDetectionConfidence: 0.6, minTrackingConfidence: 0.5 });
-    hd.onResults(onResults);
-    statusEl.textContent = 'Загружаю модель руки…';
-    await hd.initialize();
+    statusEl.textContent = 'Загружаю распознавание рук…';
+    landmarker = await createLandmarker('GPU');
     document.getElementById('start').classList.add('off');
     document.getElementById('tools').hidden = false;
-    let busy = false;
-    const loop = async () => {
-      if (!busy && video.readyState >= 2) { busy = true; try { await hd.send({ image: video }); } finally { busy = false; } }
-      requestAnimationFrame(loop);
-    };
     loop();
-    frame();
   } catch (e) {
     btn.disabled = false;
-    statusEl.textContent = 'Не удалось запустить: ' + (e.message || e) + '. Нужен доступ к камере и HTTPS/localhost.';
+    statusEl.textContent = 'Ошибка: ' + (e.message || e);
+    console.error(e);
   }
 }
-document.getElementById('startBtn').onclick = start;
 
-document.getElementById('clearBtn').onclick = () => { strokes.length = 0; stars.length = 0; sparks.length = 0; };
+document.getElementById('startBtn').onclick = start;
+document.getElementById('undoBtn').onclick = () => {
+  const last = history.pop();
+  if (last === 'stroke') { strokes.pop(); rebake(); }
+  else if (last !== undefined) for (let i = stars.length - 1; i >= 0; i--) if (stars[i].group === last) stars.splice(i, 1);
+};
+document.getElementById('clearBtn').onclick = () => {
+  strokes.length = stars.length = sparks.length = history.length = 0; current = null; rebake();
+};
 document.getElementById('shotBtn').onclick = () => {
-  const c = document.createElement('canvas'); c.width = W; c.height = H;
+  const c = document.createElement('canvas'); c.width = W * dpr; c.height = H * dpr;
   const x = c.getContext('2d');
-  const vw = video.videoWidth, vh = video.videoHeight, s = Math.max(W / vw, H / vh);
-  x.translate(W, 0); x.scale(-1, 1);
-  x.drawImage(video, (W - vw * s) / 2, (H - vh * s) / 2, vw * s, vh * s);
+  const vw = video.videoWidth, vh = video.videoHeight, s = Math.max(W / vw, H / vh) * dpr;
+  x.translate(c.width, 0); x.scale(-1, 1);
+  x.drawImage(video, (c.width - vw * s) / 2, (c.height - vh * s) / 2, vw * s, vh * s);
   x.setTransform(1, 0, 0, 1, 0, 0);
-  x.drawImage(cv, 0, 0, W, H);
+  x.drawImage(cv, 0, 0);
   const a = document.createElement('a'); a.download = 'magic-hands.png'; a.href = c.toDataURL('image/png'); a.click();
 };
+
+resize();
+window.__magic = { feed: onHands, gestureOf, strokes, stars, get mode() { return mode; }, get penDown() { return penDown; }, get frame() { return lastFrame; } };
