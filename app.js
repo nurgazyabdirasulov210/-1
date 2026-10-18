@@ -12,14 +12,26 @@ const baked = document.createElement('canvas');   // готовые линии �
 const bctx = baked.getContext('2d');
 
 function resize() {
+  const norm = W ? stars.map(s => fromScreen(s)) : null;
   dpr = Math.min(devicePixelRatio || 1, 2);
   W = innerWidth; H = innerHeight;
   for (const c of [cv, baked]) { c.width = W * dpr; c.height = H * dpr; }
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
   bctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  if (norm) stars.forEach((s, i) => { const p = toScreen(norm[i]); s.trail = []; s.x = p.x; s.y = p.y; });
   rebake();
 }
-addEventListener('resize', resize);
+let resizeQueued = false;
+function queueResize() {
+  if (resizeQueued) return;
+  resizeQueued = true;
+  requestAnimationFrame(() => requestAnimationFrame(() => { resizeQueued = false; resize(); }));
+}
+addEventListener('resize', queueResize);
+addEventListener('orientationchange', queueResize);
+video.addEventListener('resize', queueResize);   // камера сменила размер кадра
+// iOS ставит видео на паузу, когда вкладка скрыта
+document.addEventListener('visibilitychange', () => { if (!document.hidden && video.srcObject) video.play().catch(() => {}); });
 
 // ---------- настройки ----------
 const COLORS = ['#ff4fd8', '#ffe94d', '#3dfcff', '#7dff4d', '#ff8a3d', '#a98bff'];
@@ -35,10 +47,11 @@ const sparks = [];
 const history = [];           // для «Отменить»: 'stroke' | номер группы звёзд
 let colorIdx = 0, groupId = 0;
 let current = null;           // линия, которую рисуем сейчас
-let drawerKey = null;         // какая рука рисует
+let drawerId = null;          // какая рука рисует
+let trackId = 0, strokeId = 0;
 let penDown = false, mode = 'line', lastSeen = 0;
 let lastStar = null, curGroup = 0;
-const trackers = new Map();   // key -> {votes, stable, filter}
+const trackers = [];          // руки, сопоставленные между кадрами по положению запястья
 
 // ---------- фильтр дрожания (One Euro) ----------
 class OneEuro {
@@ -60,6 +73,12 @@ function toScreen(p) {
   const vw = video.videoWidth || 640, vh = video.videoHeight || 480;
   const s = Math.max(W / vw, H / vh);
   return { x: W - (p.x * vw * s + (W - vw * s) / 2), y: p.y * vh * s + (H - vh * s) / 2 };
+}
+
+function fromScreen(p) {
+  const vw = video.videoWidth || 640, vh = video.videoHeight || 480;
+  const s = Math.max(W / vw, H / vh);
+  return { x: (W - p.x - (W - vw * s) / 2) / (vw * s), y: (p.y - (H - vh * s) / 2) / (vh * s) };
 }
 
 // ---------- жесты ----------
@@ -98,29 +117,41 @@ function stableGesture(tr, g, now) {
 }
 
 // ---------- обработка кадра ----------
-function onHands(res, now) {
-  const found = [];
-  const used = new Set();
-  res.landmarks.forEach((lm, i) => {
-    let key = res.handednesses?.[i]?.[0]?.categoryName || 'Hand';
-    if (used.has(key)) key += i;
-    used.add(key);
-    let tr = trackers.get(key);
-    if (!tr) trackers.set(key, tr = { cand: 'other', n: 0, since: now, stable: 'other', prev: 'other', fx: new OneEuro(), fy: new OneEuro(), seen: 0 });
-    tr.seen = now;
-    found.push({ key, lm, g: stableGesture(tr, gestureOf(lm), now), tr });
+// сопоставляем руки с прошлым кадром по ближайшему запястью (метка Left/Right от MediaPipe часто прыгает)
+function matchTrackers(landmarks, now) {
+  const live = trackers.filter(t => now - t.seen < 1200);
+  const pairs = [];
+  landmarks.forEach((lm, i) => live.forEach(t => pairs.push({ i, t, d: Math.hypot(lm[0].x - t.wx, lm[0].y - t.wy) })));
+  pairs.sort((a, b) => a.d - b.d);
+  const byHand = new Map(), usedT = new Set();
+  for (const pr of pairs) {
+    if (pr.d > 0.3 || byHand.has(pr.i) || usedT.has(pr.t)) continue;
+    byHand.set(pr.i, pr.t); usedT.add(pr.t);
+  }
+  return landmarks.map((lm, i) => {
+    let t = byHand.get(i);
+    if (!t) trackers.push(t = { id: ++trackId, cand: 'other', n: 0, since: now, stable: 'other', prev: 'other', fx: new OneEuro(), fy: new OneEuro() });
+    t.seen = now; t.wx = lm[0].x; t.wy = lm[0].y;
+    return t;
   });
-  for (const [k, tr] of trackers) if (now - tr.seen > 1000) trackers.delete(k);
+}
 
-  // кто рисует, а кто управляет
-  let drawer = found.find(h => h.key === drawerKey);
-  const pointing = found.filter(h => h.g === 'point');
-  if (!drawer || (drawer.g !== 'point' && pointing.length)) drawer = pointing[0] || drawer || (found.length === 1 ? found[0] : null);
-  if (drawer) drawerKey = drawer.key;
-  const mod = found.find(h => h !== drawer) || null;
+function onHands(res, now) {
+  const trs = matchTrackers(res.landmarks, now);
+  const found = res.landmarks.map((lm, i) => ({ lm, tr: trs[i], g: stableGesture(trs[i], gestureOf(lm), now) }));
+  for (let i = trackers.length - 1; i >= 0; i--) if (now - trackers[i].seen > 1500) trackers.splice(i, 1);
 
-  // вторая рука в кулаке = рисуем звёзды; любая рука раскрылась = звёзды улетают
-  const newMode = mod && mod.g === 'fist' ? 'stars' : 'line';
+  // кто рисует: рука с указательным пальцем; кулак рисующим не становится
+  let drawer = found.find(h => h.tr.id === drawerId);
+  const pointing = found.find(h => h.g === 'point');
+  if (pointing && (!drawer || drawer.g !== 'point')) drawer = pointing;
+  if (!drawer && found.length === 1 && found[0].g !== 'fist' && !trackers.some(t => t.id === drawerId && now - t.seen < LOST_MS)) drawer = found[0];
+  if (drawer) drawerId = drawer.tr.id;
+
+  // вторая рука в кулаке = рисуем звёзды (переживает короткую потерю руки)
+  const fistHeld = trackers.some(t => t.id !== drawerId && t.stable === 'fist' && now - t.seen < LOST_MS);
+  const newMode = fistHeld ? 'stars' : 'line';
+  // любая рука раскрылась = звёзды улетают
   for (const h of found) {
     if (h.g === 'open' && h.tr.prev !== 'open') launchStars(toScreen(h.lm[9]));
     h.tr.prev = h.g;
@@ -131,20 +162,20 @@ function onHands(res, now) {
 
   if (drawer && drawer.g === 'point') {
     lastSeen = now;
+    if (!penDown) { drawer.tr.fx.x = null; drawer.tr.fy.x = null; }
     const raw = toScreen(drawer.lm[8]);
     const tip = { x: drawer.tr.fx.f(raw.x, now), y: drawer.tr.fy.f(raw.y, now) };
-    if (!penDown) { penDown = true; startStroke(tip); }
+    if (!penDown) { penDown = true; startStroke(); }
     moveTo(tip, now);
     return { hands: handsOut, tip };
   }
   if (penDown && (drawer || now - lastSeen > LOST_MS)) endStroke();
-  if (drawer && drawer.g !== 'point') { drawer.tr.fx.x = null; drawer.tr.fy.x = null; }
   return { hands: handsOut, tip: null };
 }
 
-function startStroke(p) {
+function startStroke() {
   if (mode === 'line') {
-    current = { pts: [p], color: COLORS[colorIdx++ % COLORS.length] };
+    current = { pts: [], color: COLORS[colorIdx++ % COLORS.length], id: ++strokeId, chunks: 0 };
   } else {
     curGroup = ++groupId; lastStar = null;
   }
@@ -152,9 +183,13 @@ function startStroke(p) {
 
 function moveTo(p, now) {
   if (mode === 'line') {
-    if (!current) startStroke(p);
-    const last = current.pts[current.pts.length - 1];
-    if (Math.hypot(p.x - last.x, p.y - last.y) > 1.5) current.pts.push(p);
+    if (!current) startStroke();
+    const last = current.pts.length && toScreen(current.pts[current.pts.length - 1]);
+    if (!last || Math.hypot(p.x - last.x, p.y - last.y) > 1.5) current.pts.push(fromScreen(p));
+    if (current.pts.length > 120) {          // длинную линию запекаем частями, чтобы не тормозило
+      flushChunk();
+      current.pts = [current.pts.at(-1)];
+    }
     if (Math.random() < .7) addSpark(p.x, p.y, current.color);
   } else {
     if (!curGroup) curGroup = ++groupId;
@@ -168,9 +203,16 @@ function moveTo(p, now) {
   }
 }
 
+function flushChunk() {
+  if (current.pts.length < 2) return;
+  const chunk = { pts: current.pts.slice(), color: current.color, id: current.id };
+  strokes.push(chunk); bake(chunk);
+  if (!current.chunks++) history.push('stroke');
+}
+
 function endStroke() {
   penDown = false;
-  if (current && current.pts.length > 1) { strokes.push(current); history.push('stroke'); bake(current); }
+  if (current) flushChunk();
   current = null; lastStar = null; curGroup = 0;
 }
 
@@ -200,6 +242,7 @@ function path(c, pts) {
 
 function neon(c, s) {
   if (s.pts.length < 2) return;
+  s = { ...s, pts: s.pts.map(toScreen) };
   c.lineCap = c.lineJoin = 'round';
   c.strokeStyle = s.color;
   c.globalAlpha = .18; c.lineWidth = 22; path(c, s.pts); c.stroke();
@@ -326,15 +369,20 @@ function loop() {
   const now = performance.now();
   if (landmarker && video.readyState >= 2 && video.currentTime !== lastVideoTime) {
     lastVideoTime = video.currentTime;
-    try { lastFrame = onHands(landmarker.detectForVideo(video, now), now); errors = 0; }
+    let res = null;
+    try { res = landmarker.detectForVideo(video, now); errors = 0; }
     catch (e) {
       console.error(e);
       // на некоторых телефонах GPU-режим падает уже во время работы — переключаемся на CPU
       if (++errors > 5 && delegate === 'GPU' && landmarker) {
         const old = landmarker; landmarker = null; delegate = 'CPU';
-        createLandmarker('CPU').then(l => { landmarker = l; errors = 0; old.close(); });
+        createLandmarker('CPU')
+          .then(l => { landmarker = l; errors = 0; })
+          .catch(err => { console.error(err); modeEl.textContent = 'Распознавание рук не запустилось. Обновите страницу'; })
+          .finally(() => { try { old.close(); } catch {} });
       }
     }
+    if (res) lastFrame = onHands(res, now);
   }
   render(now, lastFrame);
   updateHud(lastFrame);
@@ -347,6 +395,7 @@ async function start() {
   try {
     if (!navigator.mediaDevices?.getUserMedia) throw new Error('браузер не даёт доступ к камере (нужен HTTPS)');
     statusEl.textContent = 'Включаю камеру…';
+    video.srcObject?.getTracks().forEach(t => t.stop());
     const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'user', width: { ideal: 1280 }, height: { ideal: 720 } }, audio: false });
     video.srcObject = stream;
     await video.play();
@@ -365,11 +414,20 @@ async function start() {
 document.getElementById('startBtn').onclick = start;
 document.getElementById('undoBtn').onclick = () => {
   const last = history.pop();
-  if (last === 'stroke') { strokes.pop(); rebake(); }
-  else if (last !== undefined) for (let i = stars.length - 1; i >= 0; i--) if (stars[i].group === last) stars.splice(i, 1);
+  if (last === 'stroke') {
+    const id = strokes.at(-1)?.id;
+    while (strokes.length && strokes.at(-1).id === id) strokes.pop();
+    rebake();
+  } else if (last !== undefined) {
+    const before = stars.length;
+    for (let i = stars.length - 1; i >= 0; i--) if (stars[i].group === last) stars.splice(i, 1);
+    if (before === stars.length) document.getElementById('undoBtn').click();   // эти звёзды уже улетели — отменяем следующее
+  }
 };
 document.getElementById('clearBtn').onclick = () => {
-  strokes.length = stars.length = sparks.length = history.length = 0; current = null; rebake();
+  strokes.length = stars.length = sparks.length = history.length = 0;
+  current = null; lastStar = null; curGroup = 0; penDown = false;
+  rebake();
 };
 document.getElementById('shotBtn').onclick = () => {
   const c = document.createElement('canvas'); c.width = W * dpr; c.height = H * dpr;
@@ -379,7 +437,14 @@ document.getElementById('shotBtn').onclick = () => {
   x.drawImage(video, (c.width - vw * s) / 2, (c.height - vh * s) / 2, vw * s, vh * s);
   x.setTransform(1, 0, 0, 1, 0, 0);
   x.drawImage(cv, 0, 0);
-  const a = document.createElement('a'); a.download = 'magic-hands.png'; a.href = c.toDataURL('image/png'); a.click();
+  c.toBlob(async blob => {
+    c.width = c.height = 0;   // освобождаем память (важно на iOS)
+    const file = new File([blob], 'magic-hands.png', { type: 'image/png' });
+    if (navigator.canShare?.({ files: [file] })) { try { await navigator.share({ files: [file] }); return; } catch {} }
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a'); a.download = file.name; a.href = url; a.click();
+    setTimeout(() => URL.revokeObjectURL(url), 2000);
+  }, 'image/png');
 };
 
 resize();
