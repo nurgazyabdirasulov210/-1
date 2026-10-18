@@ -1,0 +1,15 @@
+* { box-sizing: border-box; }
+html, body { margin: 0; height: 100%; background: #000; overflow: hidden; font-family: system-ui, sans-serif; color: #fff; }
+#video, #fx { position: fixed; inset: 0; width: 100%; height: 100%; }
+#video { object-fit: cover; transform: scaleX(-1); }
+#fx { pointer-events: none; }
+#hint { position: fixed; left: 0; right: 0; bottom: max(12px, env(safe-area-inset-bottom)); display: flex; gap: 8px 16px; flex-wrap: wrap; justify-content: center; padding: 0 12px; font-size: 14px; pointer-events: none; }
+#hint span { background: rgba(0,0,0,.45); padding: 6px 12px; border-radius: 99px; backdrop-filter: blur(6px); }
+#start { position: fixed; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 12px; text-align: center; padding: 24px; background: radial-gradient(circle at 50% 40%, #1b1440, #05030f); }
+#start.off { display: none; }
+#start h1 { margin: 0; font-size: 40px; text-shadow: 0 0 20px #7df, 0 0 40px #f6a; }
+#start p { margin: 0; max-width: 420px; opacity: .8; }
+button { font: inherit; color: #fff; border: 1px solid rgba(255,255,255,.5); background: rgba(255,255,255,.12); padding: 10px 20px; border-radius: 99px; cursor: pointer; backdrop-filter: blur(6px); }
+#startBtn { font-size: 18px; box-shadow: 0 0 20px #7df8; }
+#tools { position: fixed; top: max(12px, env(safe-area-inset-top)); right: 12px; display: flex; gap: 8px; }
+#tools[hidden] { display: none; }
